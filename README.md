@@ -1,398 +1,507 @@
-# n8n Sandbox Server Setup
+# Embedding n8n in an Iframe (Without Paying for n8n Embed)
 
-Isolated n8n instance for embedding in node-bench. This setup provides:
+n8n's official Embed product costs $1,260/year minimum. This guide shows how to self-host n8n and embed it in your app for ~€5/month using a Hetzner VPS.
 
-- Docker Compose with n8n + Caddy reverse proxy
-- Iframe-friendly headers (no X-Frame-Options blocking)
-- Multi-layer security (origin whitelist, proxy auth, node blocking)
-- Auto-cleanup of old executions
+**What we built:** An n8n instance that loads inside an iframe with automatic login—no login screen, users go straight to the workflow editor.
 
 ---
 
-## 1. Architecture Overview
+## The Problem
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  ALLOWED ORIGINS (whitelist)                                       │
-│  ├── https://node-bench.com                                        │
-│  ├── https://www.node-bench.com                                    │
-│  ├── https://*.vercel.app          (preview deployments)           │
-│  └── http://localhost:3000          (local dev)                    │
-└────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  LAYER 1: Nuxt Backend Proxy (/server/api/n8n/[...].ts)            │
-│  ───────────────────────────────────────────────────────────────── │
-│  • Validates Origin header against whitelist                       │
-│  • Validates Referer header                                        │
-│  • Adds internal auth token before forwarding                      │
-│  • Strips sensitive headers from response                          │
-│  • Rate limiting per IP (optional)                                 │
-└────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  LAYER 2: Caddy Reverse Proxy (Hetzner server)                     │
-│  ───────────────────────────────────────────────────────────────── │
-│  • SSL termination (Let's Encrypt)                                 │
-│  • Validates X-NodeBench-Proxy-Token header                        │
-│  • Removes X-Frame-Options header                                  │
-│  • Sets Content-Security-Policy: frame-ancestors <whitelist>       │
-│  • IP whitelist: only accepts from Vercel IPs + your server        │
-└────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  LAYER 3: n8n Container (isolated)                                 │
-│  ───────────────────────────────────────────────────────────────── │
-│  • Bound to localhost only (not exposed to internet)               │
-│  • Dangerous nodes blocked                                         │
-│  • Execution timeouts enforced                                     │
-│  • Data auto-pruned                                                │
-└────────────────────────────────────────────────────────────────────┘
-```
+When you try to embed self-hosted n8n in an iframe, you hit three blockers:
+
+1. **X-Frame-Options header** - n8n sends `X-Frame-Options: SAMEORIGIN`, browsers refuse to load it
+2. **Login screen** - Users see a login form inside the iframe
+3. **SameSite cookies** - n8n's auth cookie has `SameSite=Lax`, browsers block it in cross-origin iframes
 
 ---
 
-## 2. Server Requirements (Hetzner)
+## The Solution
 
-| Spec         | Recommendation                                       |
-| ------------ | ---------------------------------------------------- |
-| **Instance** | CX22 (2 vCPU, 4GB RAM) - ~€4/month                   |
-| **OS**       | Ubuntu 24.04 LTS                                     |
-| **Storage**  | 40GB SSD (default)                                   |
-| **Location** | Nuremberg or Falkenstein (EU)                        |
-| **Domain**   | Use nip.io (free) or custom domain                   |
-| **Firewall** | Allow ports 80, 443 only                             |
-
-### Domain Options
-
-**Option A: nip.io (recommended for testing)**
-
-nip.io is a free wildcard DNS service. Any `<anything>.<IP>.nip.io` resolves to that IP.
-
-```
-Server IP: 77.42.27.235
-Domain:    77.42.27.235.nip.io
-URL:       https://77.42.27.235.nip.io
-```
-
-- No DNS configuration needed
-- Works with Let's Encrypt SSL
-- Perfect for testing before buying a domain
-
-**Option B: Custom domain (production)**
-
-- Point `sandbox.node-bench.com` A record to server IP
-- More professional, easier to remember
+We use Caddy as a reverse proxy to:
+- Strip the `X-Frame-Options` header
+- Inject a trusted header that auto-logs users in
+- Configure n8n to use `SameSite=None` cookies
 
 ---
 
-## 3. Security Layers - Detailed
+## Step 1: Create a Hetzner Server
 
-### 3.1 Origin/Referer Validation (Nuxt Proxy)
-
-**Whitelist:**
-
-```
-ALLOWED_ORIGINS:
-  - https://node-bench.com
-  - https://www.node-bench.com
-  - https://*.vercel.app          # Preview deployments
-  - http://localhost:3000         # Local dev
-  - http://localhost:3001         # Alternative local port
-```
-
-**Validation logic:**
-
-- Check `Origin` header first
-- Fall back to `Referer` header if Origin missing
-- Reject with 403 if neither matches whitelist
-- Log rejected attempts for monitoring
-
-### 3.2 Proxy Authentication Token
-
-**Purpose:** Ensure only your Nuxt backend can reach the sandbox
-
-```
-PROXY_AUTH_TOKEN: <32+ character random string>
-
-Header added by Nuxt proxy:
-X-NodeBench-Proxy-Token: <token>
-
-Caddy validates this header before forwarding to n8n
-```
-
-### 3.3 IP Whitelisting (Caddy layer)
-
-**Allow only:**
-
-- Vercel's edge IP ranges (for production)
-- Your development machine IP (for testing)
-- Localhost (for Caddy → n8n internal)
-
-**Vercel IP ranges:** https://vercel.com/docs/security/deployment-protection#ip-addresses
-
-### 3.4 n8n Node Blocking
-
-**Block these dangerous nodes:**
-
-```
-NODES_EXCLUDE:
-  - n8n-nodes-base.executeCommand     # Shell execution
-  - n8n-nodes-base.readWriteFile      # File system access
-  - n8n-nodes-base.writeBinaryFile    # Binary file writes
-  - n8n-nodes-base.executeWorkflow    # Workflow chaining (escape sandbox)
-  - n8n-nodes-base.ssh                # SSH access
-  - n8n-nodes-base.ftp                # FTP access
-  - n8n-nodes-base.localFileTrigger   # File system watching
-```
-
-### 3.5 Execution Limits
-
-```
-EXECUTIONS_TIMEOUT: 30              # Max 30 seconds per execution
-EXECUTIONS_TIMEOUT_MAX: 60          # Hard limit even if user overrides
-N8N_CONCURRENCY_PRODUCTION_LIMIT: 5 # Max 5 concurrent executions
-```
-
-### 3.6 Data Pruning (no persistence)
-
-```
-EXECUTIONS_DATA_PRUNE: true
-EXECUTIONS_DATA_MAX_AGE: 1          # Delete after 1 hour
-EXECUTIONS_DATA_PRUNE_MAX_COUNT: 50 # Keep max 50 executions
-EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
-EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: false
-```
+1. Go to [Hetzner Cloud Console](https://console.hetzner.cloud/)
+2. Create a new project
+3. Add a server:
+   - **Location:** Nuremberg or Falkenstein
+   - **Image:** Ubuntu 24.04
+   - **Type:** CX22 (2 vCPU, 4GB RAM) - €4.51/month
+   - **SSH Key:** Add your public key
+4. Note the server IP (e.g., `77.42.27.235`)
 
 ---
 
-## 4. HTTP Headers Configuration
-
-### 4.1 Headers to REMOVE (allow iframe)
-
-```
-X-Frame-Options: <remove entirely>
-```
-
-### 4.2 Headers to ADD
-
-```
-Content-Security-Policy: frame-ancestors https://node-bench.com https://www.node-bench.com https://*.vercel.app http://localhost:3000
-
-X-Content-Type-Options: nosniff
-Referrer-Policy: strict-origin-when-cross-origin
-```
-
-### 4.3 CORS Headers (for API/fetch requests)
-
-```
-Access-Control-Allow-Origin: <origin from whitelist>
-Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
-Access-Control-Allow-Headers: Content-Type, Authorization, X-NodeBench-Token
-Access-Control-Allow-Credentials: true
-```
-
----
-
-## 5. n8n Environment Variables - Complete List
+## Step 2: SSH into the Server
 
 ```bash
-# === CORE ===
-N8N_HOST=77.42.27.235.nip.io
-N8N_PORT=5678
-N8N_PROTOCOL=https
-WEBHOOK_URL=https://77.42.27.235.nip.io/
+ssh root@YOUR_SERVER_IP
+```
+
+If you get a host key warning, accept it.
+
+---
+
+## Step 3: Install Docker
+
+```bash
+curl -fsSL https://get.docker.com | sh
+```
+
+---
+
+## Step 4: Create the Project Directory
+
+```bash
+mkdir -p /root/n8n-docker-caddy/caddy_config
+mkdir -p /root/n8n-docker-caddy/local_files
+cd /root/n8n-docker-caddy
+```
+
+---
+
+## Step 5: Create the .env File
+
+We use [nip.io](https://nip.io) for free wildcard DNS. Any `*.YOUR_IP.nip.io` resolves to your IP.
+
+```bash
+cat > .env << 'EOF'
+DATA_FOLDER=/root/n8n-docker-caddy
+DOMAIN_NAME=YOUR_IP.nip.io
+SUBDOMAIN=
 GENERIC_TIMEZONE=Europe/Berlin
-TZ=Europe/Berlin
+EOF
+```
 
-# === SECURITY ===
-NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.readWriteFile","n8n-nodes-base.writeBinaryFile","n8n-nodes-base.executeWorkflow","n8n-nodes-base.ssh","n8n-nodes-base.ftp","n8n-nodes-base.localFileTrigger"]
+Replace `YOUR_IP` with your actual server IP. For example, if your IP is `77.42.27.235`:
 
-# === EXECUTION LIMITS ===
-EXECUTIONS_TIMEOUT=30
-EXECUTIONS_TIMEOUT_MAX=60
-N8N_CONCURRENCY_PRODUCTION_LIMIT=5
-
-# === DATA PRUNING ===
-EXECUTIONS_DATA_PRUNE=true
-EXECUTIONS_DATA_MAX_AGE=1
-EXECUTIONS_DATA_PRUNE_MAX_COUNT=50
-EXECUTIONS_DATA_SAVE_ON_SUCCESS=none
-EXECUTIONS_DATA_SAVE_ON_ERROR=all
-EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS=false
-
-# === DISABLE UNNECESSARY FEATURES ===
-N8N_TEMPLATES_ENABLED=false
-N8N_VERSION_NOTIFICATIONS_ENABLED=false
-N8N_DIAGNOSTICS_ENABLED=false
-N8N_PUBLIC_API_DISABLED=true
-N8N_PUBLIC_API_SWAGGERUI_DISABLED=true
-
-# === DATABASE ===
-DB_TYPE=sqlite  # Simple, no separate DB container needed
-
-# === RUNNERS (code isolation) ===
-N8N_RUNNERS_ENABLED=true
+```bash
+sed -i 's/YOUR_IP/77.42.27.235/g' .env
 ```
 
 ---
 
-## 6. Nuxt Proxy API Route - Requirements
+## Step 6: Create docker-compose.yml
 
-**Path:** `/server/api/n8n/[...path].ts`
+```bash
+cat > docker-compose.yml << 'EOF'
+services:
+  caddy:
+    image: caddy:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - ${DATA_FOLDER}/caddy_config:/config
+      - ${DATA_FOLDER}/caddy_config/Caddyfile:/etc/caddy/Caddyfile
 
-**Responsibilities:**
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    restart: always
+    ports:
+      - 5678:5678
+    environment:
+      - N8N_HOST=${SUBDOMAIN}${SUBDOMAIN:+.}${DOMAIN_NAME}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://${SUBDOMAIN}${SUBDOMAIN:+.}${DOMAIN_NAME}/
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - N8N_PROXY_HOPS=1
+      # Auto-login via trusted header
+      - EXTERNAL_HOOK_FILES=/home/node/.n8n/hooks.js
+      - N8N_FORWARD_AUTH_HEADER=X-Sandbox-User
+      # CRITICAL: Without this, cookies don't work in cross-origin iframes
+      - N8N_SAMESITE_COOKIE=none
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ${DATA_FOLDER}/local_files:/files
+      - ${DATA_FOLDER}/hooks.js:/home/node/.n8n/hooks.js:ro
 
-1. Extract `path` param (everything after `/api/n8n/`)
-2. Validate `Origin` or `Referer` against whitelist
-3. Add `X-NodeBench-Proxy-Token` header
-4. Forward request to `https://sandbox.node-bench.com/{path}`
-5. Stream response back (important for SSE/WebSocket)
-6. Handle errors gracefully
-
-**Environment variables needed in Nuxt:**
-
-```
-N8N_SANDBOX_URL=https://sandbox.node-bench.com
-N8N_PROXY_TOKEN=<same token as Caddy expects>
+volumes:
+  caddy_data:
+    external: true
+  n8n_data:
+    external: true
+EOF
 ```
 
 ---
 
-## 7. Frontend Iframe Component - Requirements
+## Step 7: Create the Caddyfile
 
-**Props:**
+Replace `YOUR_IP` with your server IP:
+
+```bash
+cat > caddy_config/Caddyfile << 'EOF'
+YOUR_IP.nip.io {
+    reverse_proxy n8n:5678 {
+        flush_interval -1
+        # This header triggers auto-login via hooks.js
+        header_up X-Sandbox-User contact@node-bench.com
+    }
+
+    # Remove the header that blocks iframes
+    header -X-Frame-Options
+
+    # Only allow embedding from these origins
+    header Content-Security-Policy "frame-ancestors 'self' https://node-bench.com https://www.node-bench.com https://*.vercel.app http://localhost:3000"
+
+    # Standard security headers
+    header X-Content-Type-Options "nosniff"
+    header Referrer-Policy "strict-origin-when-cross-origin"
+}
+EOF
+```
+
+Replace YOUR_IP:
+
+```bash
+sed -i 's/YOUR_IP/77.42.27.235/g' caddy_config/Caddyfile
+```
+
+---
+
+## Step 8: Create hooks.js (The Auto-Login Magic)
+
+This hook intercepts requests, looks up the user by the email in the trusted header, and issues an auth cookie.
+
+```bash
+cat > hooks.js << 'EOF'
+const { dirname, resolve } = require('path')
+const Layer = require('router/lib/layer')
+const { issueCookie } = require(resolve(dirname(require.resolve('n8n')), 'auth/jwt'))
+const ignoreAuthRegexp = /^\/(assets|healthz|webhook|rest\/oauth2-credential)/
+
+module.exports = {
+    n8n: {
+        ready: [
+            async function ({ app }, config) {
+                const { stack } = app.router
+                const index = stack.findIndex((l) => l.name === 'cookieParser')
+                stack.splice(index + 1, 0, new Layer('/', {
+                    strict: false,
+                    end: false
+                }, async (req, res, next) => {
+                    if (ignoreAuthRegexp.test(req.url)) return next()
+                    if (!config.get('userManagement.isInstanceOwnerSetUp', false)) return next()
+                    if (req.cookies?.['n8n-auth']) return next()
+                    if (!process.env.N8N_FORWARD_AUTH_HEADER) return next()
+
+                    const email = req.headers[process.env.N8N_FORWARD_AUTH_HEADER.toLowerCase()]
+                    if (!email) return next()
+
+                    const user = await this.dbCollections.User.findOneBy({email})
+                    if (!user) {
+                        res.statusCode = 401
+                        res.end('User ' + email + ' not found')
+                        return
+                    }
+                    if (!user.role) user.role = {}
+
+                    issueCookie(res, user)
+                    return next()
+                }))
+            },
+        ],
+    },
+}
+EOF
+```
+
+---
+
+## Step 9: Create Docker Volumes
+
+```bash
+docker volume create caddy_data
+docker volume create n8n_data
+```
+
+---
+
+## Step 10: Start the Services
+
+```bash
+docker compose up -d
+```
+
+Check the logs:
+
+```bash
+docker compose logs -f
+```
+
+Wait until you see:
+```
+n8n-1  | Editor is now accessible via:
+n8n-1  | https://YOUR_IP.nip.io
+```
+
+---
+
+## Step 11: Create the Owner Account
+
+**This is critical.** The email you use here MUST match the email in the Caddyfile.
+
+1. Open `https://YOUR_IP.nip.io` in your browser
+2. Create an account with email: `contact@node-bench.com` (or whatever you put in the Caddyfile)
+3. Complete the setup wizard
+
+---
+
+## Step 12: Test the Auto-Login
+
+```bash
+curl -I "https://YOUR_IP.nip.io/"
+```
+
+You should see:
+- `HTTP/2 200`
+- `set-cookie: n8n-auth=...; SameSite=None; Secure`
+
+If you see `SameSite=Lax` instead, the `N8N_SAMESITE_COOKIE=none` env var isn't working. Restart n8n:
+
+```bash
+docker compose up -d --force-recreate n8n
+```
+
+---
+
+## Step 13: Create the Iframe Test Page
+
+In your frontend app, create a simple test page:
+
+```vue
+<script setup lang="ts">
+const n8nUrl = "https://YOUR_IP.nip.io";
+</script>
+
+<template>
+  <div class="min-h-screen bg-gray-900 p-8">
+    <h1 class="text-2xl font-bold text-white mb-4">n8n Embed Test</h1>
+    <div class="border border-gray-700 rounded-lg overflow-hidden">
+      <iframe
+        :src="n8nUrl"
+        class="w-full"
+        style="height: 700px"
+        allow="clipboard-read; clipboard-write"
+      />
+    </div>
+  </div>
+</template>
+```
+
+---
+
+## Troubleshooting
+
+### "User xxx@xxx.com not found"
+
+The email in the Caddyfile doesn't match the owner account email. Either:
+- Update the Caddyfile to use the correct email, then `docker compose restart caddy`
+- Or delete the n8n volume and recreate the account with the right email
+
+### Login screen still shows
+
+1. Check the cookie has `SameSite=None`:
+   ```bash
+   curl -I "https://YOUR_IP.nip.io/" | grep -i set-cookie
+   ```
+
+2. If it says `SameSite=Lax`, the env var isn't set. Check:
+   ```bash
+   docker compose exec n8n env | grep SAMESITE
+   ```
+
+3. Recreate the container:
+   ```bash
+   docker compose up -d --force-recreate n8n
+   ```
+
+### Iframe blocked
+
+Check the Content-Security-Policy allows your origin:
+```bash
+curl -I "https://YOUR_IP.nip.io/" | grep -i content-security-policy
+```
+
+Add your domain to the `frame-ancestors` list in the Caddyfile.
+
+---
+
+## Critical Gotchas We Discovered
+
+### 1. N8N_SAMESITE_COOKIE=none is essential
+
+Without this, the auth cookie has `SameSite=Lax` and browsers block it in cross-origin iframes. This undocumented env var was found by reading n8n's source code.
+
+### 2. The owner account email must match the Caddyfile
+
+The hooks.js looks up users by email. If the email in `header_up X-Sandbox-User` doesn't match an existing user, you get a 401.
+
+### 3. Don't delete the n8n_data volume
+
+The owner account is stored in SQLite inside this volume. If you delete it, you need to recreate the account.
+
+### 4. flush_interval -1 in Caddy
+
+This enables streaming for Server-Sent Events (SSE), which n8n uses for real-time updates.
+
+---
+
+## File Structure on Server
+
+```
+/root/n8n-docker-caddy/
+├── .env
+├── docker-compose.yml
+├── hooks.js
+├── caddy_config/
+│   └── Caddyfile
+└── local_files/
+```
+
+---
+
+## Cost
+
+| Item         | Monthly Cost |
+|--------------|--------------|
+| Hetzner CX22 | €4.51        |
+| Domain       | Free (nip.io)|
+| **Total**    | **~€5/month**|
+
+Compare to n8n Embed: $105/month ($1,260/year).
+
+---
+
+## Frontend Integration (Nuxt/Node-Bench)
+
+This section is for your main app, not the sandbox server.
+
+### Basic Iframe Embed
+
+Create a page or component that embeds the n8n instance:
+
+```vue
+<!-- app/pages/test-embed.vue -->
+<script setup lang="ts">
+const n8nUrl = "https://YOUR_IP.nip.io";
+</script>
+
+<template>
+  <div class="min-h-screen bg-gray-900 p-8">
+    <h1 class="text-2xl font-bold text-white mb-4">n8n Embed Test</h1>
+    <div class="border border-gray-700 rounded-lg overflow-hidden">
+      <iframe
+        :src="n8nUrl"
+        class="w-full"
+        style="height: 700px"
+        allow="clipboard-read; clipboard-write"
+      />
+    </div>
+  </div>
+</template>
+```
+
+### Environment Variable (Recommended)
+
+Don't hardcode the URL. Add to your `.env`:
+
+```bash
+N8N_SANDBOX_URL=https://YOUR_IP.nip.io
+```
+
+Then use it in your component:
+
+```vue
+<script setup lang="ts">
+const config = useRuntimeConfig();
+const n8nUrl = config.public.n8nSandboxUrl;
+</script>
+```
+
+Add to `nuxt.config.ts`:
 
 ```typescript
-interface N8nEmbedProps {
-  workflowJson?: object; // Pre-load a workflow
-  height?: string; // Default: "600px"
-  allowExecution?: boolean; // Default: true
-}
+export default defineNuxtConfig({
+  runtimeConfig: {
+    public: {
+      n8nSandboxUrl: process.env.N8N_SANDBOX_URL || '',
+    },
+  },
+});
 ```
 
-**Behavior:**
+### Reusable Component
 
-- Renders `<iframe src="/api/n8n/" />`
-- Optionally passes workflow via postMessage after load
-- Handles n8n events (workflow saved, execution complete) via postMessage
+For production, create a reusable component:
+
+```vue
+<!-- app/components/N8nEmbed.vue -->
+<script setup lang="ts">
+defineProps<{
+  height?: string;
+}>();
+
+const config = useRuntimeConfig();
+const n8nUrl = config.public.n8nSandboxUrl;
+</script>
+
+<template>
+  <div class="border border-gray-700 rounded-lg overflow-hidden">
+    <iframe
+      v-if="n8nUrl"
+      :src="n8nUrl"
+      class="w-full"
+      :style="{ height: height || '700px' }"
+      allow="clipboard-read; clipboard-write"
+    />
+    <div v-else class="p-4 text-red-500">
+      N8N_SANDBOX_URL not configured
+    </div>
+  </div>
+</template>
+```
+
+Use it anywhere:
+
+```vue
+<N8nEmbed height="800px" />
+```
+
+### Loading a Specific Workflow
+
+To open a specific workflow, append the workflow ID to the URL:
+
+```vue
+<iframe :src="`${n8nUrl}/workflow/abc123`" />
+```
+
+### Communicating with the Iframe (Future)
+
+n8n doesn't have a postMessage API, but you could potentially:
+- Pre-load workflows by navigating to specific URLs
+- Use URL parameters if n8n supports them
+- Build a custom n8n node that communicates with your app
 
 ---
 
-## 8. Authentication Strategy
+## Security Considerations
 
-**Option A: Shared guest account (simplest)**
+This setup trusts anyone who can reach the server. For production:
 
-- Create a single `guest@node-bench.com` user in n8n
-- Auto-login via URL parameter or cookie set by proxy
+1. Add IP whitelisting in Caddy to only allow requests from your app's servers
+2. Use a proxy token that your backend adds to requests
+3. Block dangerous n8n nodes (executeCommand, ssh, ftp, etc.)
 
-**Option B: Disable auth entirely (recommended for sandbox)**
-
-- Set n8n to not require login
-- Security relies entirely on proxy layer
-- Simpler but requires robust proxy security
-
-**Recommendation:** Option B - security via proxy whitelist
-
----
-
-## 9. File Structure (to be created)
-
-```
-n8n-sandbox/
-├── README.md                    # This file
-├── .env.example                 # Template environment file
-├── docker-compose.yml           # n8n + Caddy services
-├── Caddyfile                    # Reverse proxy config
-└── scripts/
-    └── reset-sandbox.sh         # Cron job to reset data
-
-server/api/n8n/
-└── [...path].ts                 # Nuxt proxy route
-
-app/components/
-└── N8nEmbed.vue                 # Iframe wrapper component
-```
-
----
-
-## 10. Quick Start
-
-```bash
-# 1. Create Hetzner server (CX22, Ubuntu 24.04)
-#    Note your server IP (e.g., 5.78.100.123)
-
-# 2. SSH into your server
-ssh root@YOUR_SERVER_IP
-
-# 3. Install Docker
-curl -fsSL https://get.docker.com | sh
-
-# 4. Clone this repo
-git clone git@github.com:lukaskunhardt/n8n-sandbox.git
-cd n8n-sandbox
-
-# 5. Configure environment
-cp .env.example .env
-
-# 6. Edit .env - set your domain using nip.io
-#    Replace YOUR_SERVER_IP with actual IP (e.g., 5.78.100.123)
-nano .env
-```
-
-**.env example with nip.io:**
-
-```bash
-# Use your server IP with nip.io
-DOMAIN=YOUR_SERVER_IP.nip.io
-
-# Example: DOMAIN=5.78.100.123.nip.io
-```
-
-```bash
-# 7. Start services
-docker compose up -d
-
-# 8. Check logs
-docker compose logs -f
-
-# 9. Test it works
-#    Open in browser: https://YOUR_SERVER_IP.nip.io
-#    (SSL cert may take 1-2 minutes on first load)
-```
-
----
-
-## 11. Testing Checklist
-
-- [ ] n8n loads in iframe from localhost:3000
-- [ ] n8n loads in iframe from production domain
-- [ ] n8n loads in iframe from Vercel preview URL
-- [ ] Direct access to sandbox.node-bench.com is blocked (no valid proxy token)
-- [ ] Blocked nodes don't appear in node panel
-- [ ] Execution times out after 30 seconds
-- [ ] Old execution data is pruned
-- [ ] Workflow can be executed and results viewed
-- [ ] WebSocket/SSE connections work (real-time updates)
-
----
-
-## 12. Cost Estimate
-
-| Item            | Monthly Cost  |
-| --------------- | ------------- |
-| Hetzner CX22    | ~€4           |
-| Domain (if new) | ~€1           |
-| **Total**       | **~€5/month** |
-
-# Just clone the submodule repo directly
-
-git clone git@github.com:lukaskunhardt/n8n-sandbox.git
-cd n8n-sandbox
-
-# edit .env
-
-docker compose up -d
+See the original architecture diagram at the top of the old README for the full production security model.
