@@ -1,6 +1,7 @@
 # n8n Sandbox Server Setup
 
 Isolated n8n instance for embedding in node-bench. This setup provides:
+
 - Docker Compose with n8n + Caddy reverse proxy
 - Iframe-friendly headers (no X-Frame-Options blocking)
 - Multi-layer security (origin whitelist, proxy auth, node blocking)
@@ -56,14 +57,35 @@ Isolated n8n instance for embedding in node-bench. This setup provides:
 
 ## 2. Server Requirements (Hetzner)
 
-| Spec | Recommendation |
-|------|----------------|
-| **Instance** | CX22 (2 vCPU, 4GB RAM) - ~€4/month |
-| **OS** | Ubuntu 24.04 LTS |
-| **Storage** | 40GB SSD (default) |
-| **Location** | Nuremberg or Falkenstein (EU) |
-| **Domain** | `sandbox.node-bench.com` (A record → server IP) |
-| **Firewall** | Allow ports 80, 443 only |
+| Spec         | Recommendation                                       |
+| ------------ | ---------------------------------------------------- |
+| **Instance** | CX22 (2 vCPU, 4GB RAM) - ~€4/month                   |
+| **OS**       | Ubuntu 24.04 LTS                                     |
+| **Storage**  | 40GB SSD (default)                                   |
+| **Location** | Nuremberg or Falkenstein (EU)                        |
+| **Domain**   | Use nip.io (free) or custom domain                   |
+| **Firewall** | Allow ports 80, 443 only                             |
+
+### Domain Options
+
+**Option A: nip.io (recommended for testing)**
+
+nip.io is a free wildcard DNS service. Any `<anything>.<IP>.nip.io` resolves to that IP.
+
+```
+Server IP: 77.42.27.235
+Domain:    77.42.27.235.nip.io
+URL:       https://77.42.27.235.nip.io
+```
+
+- No DNS configuration needed
+- Works with Let's Encrypt SSL
+- Perfect for testing before buying a domain
+
+**Option B: Custom domain (production)**
+
+- Point `sandbox.node-bench.com` A record to server IP
+- More professional, easier to remember
 
 ---
 
@@ -72,6 +94,7 @@ Isolated n8n instance for embedding in node-bench. This setup provides:
 ### 3.1 Origin/Referer Validation (Nuxt Proxy)
 
 **Whitelist:**
+
 ```
 ALLOWED_ORIGINS:
   - https://node-bench.com
@@ -82,6 +105,7 @@ ALLOWED_ORIGINS:
 ```
 
 **Validation logic:**
+
 - Check `Origin` header first
 - Fall back to `Referer` header if Origin missing
 - Reject with 403 if neither matches whitelist
@@ -103,6 +127,7 @@ Caddy validates this header before forwarding to n8n
 ### 3.3 IP Whitelisting (Caddy layer)
 
 **Allow only:**
+
 - Vercel's edge IP ranges (for production)
 - Your development machine IP (for testing)
 - Localhost (for Caddy → n8n internal)
@@ -112,6 +137,7 @@ Caddy validates this header before forwarding to n8n
 ### 3.4 n8n Node Blocking
 
 **Block these dangerous nodes:**
+
 ```
 NODES_EXCLUDE:
   - n8n-nodes-base.executeCommand     # Shell execution
@@ -146,11 +172,13 @@ EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: false
 ## 4. HTTP Headers Configuration
 
 ### 4.1 Headers to REMOVE (allow iframe)
+
 ```
 X-Frame-Options: <remove entirely>
 ```
 
 ### 4.2 Headers to ADD
+
 ```
 Content-Security-Policy: frame-ancestors https://node-bench.com https://www.node-bench.com https://*.vercel.app http://localhost:3000
 
@@ -159,6 +187,7 @@ Referrer-Policy: strict-origin-when-cross-origin
 ```
 
 ### 4.3 CORS Headers (for API/fetch requests)
+
 ```
 Access-Control-Allow-Origin: <origin from whitelist>
 Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
@@ -172,10 +201,10 @@ Access-Control-Allow-Credentials: true
 
 ```bash
 # === CORE ===
-N8N_HOST=sandbox.node-bench.com
+N8N_HOST=77.42.27.235.nip.io
 N8N_PORT=5678
 N8N_PROTOCOL=https
-WEBHOOK_URL=https://sandbox.node-bench.com/
+WEBHOOK_URL=https://77.42.27.235.nip.io/
 GENERIC_TIMEZONE=Europe/Berlin
 TZ=Europe/Berlin
 
@@ -216,6 +245,7 @@ N8N_RUNNERS_ENABLED=true
 **Path:** `/server/api/n8n/[...path].ts`
 
 **Responsibilities:**
+
 1. Extract `path` param (everything after `/api/n8n/`)
 2. Validate `Origin` or `Referer` against whitelist
 3. Add `X-NodeBench-Proxy-Token` header
@@ -224,6 +254,7 @@ N8N_RUNNERS_ENABLED=true
 6. Handle errors gracefully
 
 **Environment variables needed in Nuxt:**
+
 ```
 N8N_SANDBOX_URL=https://sandbox.node-bench.com
 N8N_PROXY_TOKEN=<same token as Caddy expects>
@@ -234,15 +265,17 @@ N8N_PROXY_TOKEN=<same token as Caddy expects>
 ## 7. Frontend Iframe Component - Requirements
 
 **Props:**
+
 ```typescript
 interface N8nEmbedProps {
-  workflowJson?: object;    // Pre-load a workflow
-  height?: string;          // Default: "600px"
+  workflowJson?: object; // Pre-load a workflow
+  height?: string; // Default: "600px"
   allowExecution?: boolean; // Default: true
 }
 ```
 
 **Behavior:**
+
 - Renders `<iframe src="/api/n8n/" />`
 - Optionally passes workflow via postMessage after load
 - Handles n8n events (workflow saved, execution complete) via postMessage
@@ -252,10 +285,12 @@ interface N8nEmbedProps {
 ## 8. Authentication Strategy
 
 **Option A: Shared guest account (simplest)**
+
 - Create a single `guest@node-bench.com` user in n8n
 - Auto-login via URL parameter or cookie set by proxy
 
 **Option B: Disable auth entirely (recommended for sandbox)**
+
 - Set n8n to not require login
 - Security relies entirely on proxy layer
 - Simpler but requires robust proxy security
@@ -287,25 +322,46 @@ app/components/
 ## 10. Quick Start
 
 ```bash
-# 1. SSH into your Hetzner server
-ssh root@your-server-ip
+# 1. Create Hetzner server (CX22, Ubuntu 24.04)
+#    Note your server IP (e.g., 5.78.100.123)
 
-# 2. Install Docker (if not installed)
+# 2. SSH into your server
+ssh root@YOUR_SERVER_IP
+
+# 3. Install Docker
 curl -fsSL https://get.docker.com | sh
 
-# 3. Clone this repo
-git clone https://github.com/your-repo/node-bench.git
-cd node-bench/n8n-sandbox
+# 4. Clone this repo
+git clone git@github.com:lukaskunhardt/n8n-sandbox.git
+cd n8n-sandbox
 
-# 4. Configure environment
+# 5. Configure environment
 cp .env.example .env
-nano .env  # Edit with your values
 
-# 5. Start services
+# 6. Edit .env - set your domain using nip.io
+#    Replace YOUR_SERVER_IP with actual IP (e.g., 5.78.100.123)
+nano .env
+```
+
+**.env example with nip.io:**
+
+```bash
+# Use your server IP with nip.io
+DOMAIN=YOUR_SERVER_IP.nip.io
+
+# Example: DOMAIN=5.78.100.123.nip.io
+```
+
+```bash
+# 7. Start services
 docker compose up -d
 
-# 6. Check logs
+# 8. Check logs
 docker compose logs -f
+
+# 9. Test it works
+#    Open in browser: https://YOUR_SERVER_IP.nip.io
+#    (SSL cert may take 1-2 minutes on first load)
 ```
 
 ---
@@ -326,8 +382,17 @@ docker compose logs -f
 
 ## 12. Cost Estimate
 
-| Item | Monthly Cost |
-|------|--------------|
-| Hetzner CX22 | ~€4 |
-| Domain (if new) | ~€1 |
-| **Total** | **~€5/month** |
+| Item            | Monthly Cost  |
+| --------------- | ------------- |
+| Hetzner CX22    | ~€4           |
+| Domain (if new) | ~€1           |
+| **Total**       | **~€5/month** |
+
+# Just clone the submodule repo directly
+
+git clone git@github.com:lukaskunhardt/n8n-sandbox.git
+cd n8n-sandbox
+
+# edit .env
+
+docker compose up -d
